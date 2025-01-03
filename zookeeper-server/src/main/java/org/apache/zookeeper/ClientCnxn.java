@@ -19,13 +19,10 @@
 package org.apache.zookeeper;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
-import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
@@ -67,10 +64,12 @@ import org.apache.zookeeper.Watcher.Event.KeeperState;
 import org.apache.zookeeper.ZooDefs.OpCode;
 import org.apache.zookeeper.ZooKeeper.States;
 import org.apache.zookeeper.ZooKeeper.WatchRegistration;
+import org.apache.zookeeper.client.FourLetterWordMain;
 import org.apache.zookeeper.client.HostProvider;
 import org.apache.zookeeper.client.ZKClientConfig;
 import org.apache.zookeeper.client.ZooKeeperSaslClient;
 import org.apache.zookeeper.common.Time;
+import org.apache.zookeeper.common.X509Exception;
 import org.apache.zookeeper.proto.AuthPacket;
 import org.apache.zookeeper.proto.ConnectRequest;
 import org.apache.zookeeper.proto.Create2Response;
@@ -164,6 +163,8 @@ public class ClientCnxn {
     private volatile int negotiatedSessionTimeout;
 
     private int readTimeout;
+
+    private int expirationTimeout;
 
     private final int sessionTimeout;
 
@@ -411,6 +412,7 @@ public class ClientCnxn {
 
         this.connectTimeout = sessionTimeout / hostProvider.size();
         this.readTimeout = sessionTimeout * 2 / 3;
+        this.expirationTimeout = sessionTimeout * 4 / 3;
 
         this.sendThread = new SendThread(clientCnxnSocket);
         this.eventThread = new EventThread();
@@ -803,6 +805,12 @@ public class ClientCnxn {
 
     }
 
+    private static class ConnectionTimeoutException extends IOException {
+        public ConnectionTimeoutException(String message) {
+            super(message);
+        }
+    }
+
     private static class SessionTimeoutException extends IOException {
 
         private static final long serialVersionUID = 824482094072071178L;
@@ -1143,7 +1151,7 @@ public class ClientCnxn {
                         startConnect(serverAddress);
                         // Update now to start the connection timer right after we make a connection attempt
                         clientCnxnSocket.updateNow();
-                        clientCnxnSocket.updateLastSendAndHeard();
+                        clientCnxnSocket.updateLastSend();
                     }
 
                     if (state.isConnected()) {
@@ -1181,16 +1189,24 @@ public class ClientCnxn {
                         }
                         to = readTimeout - clientCnxnSocket.getIdleRecv();
                     } else {
-                        to = connectTimeout - clientCnxnSocket.getIdleRecv();
+                        to = connectTimeout - clientCnxnSocket.getIdleSend();
                     }
 
-                    if (to <= 0) {
+                    int expiration = expirationTimeout - clientCnxnSocket.getIdleRecv();
+                    if (expiration <= 0) {
                         String warnInfo = String.format(
                             "Client session timed out, have not heard from server in %dms for session id 0x%s",
                             clientCnxnSocket.getIdleRecv(),
                             Long.toHexString(sessionId));
                         LOG.warn(warnInfo);
+                        changeZkState(States.CLOSED);
                         throw new SessionTimeoutException(warnInfo);
+                    } else if (to <= 0) {
+                        String warnInfo = String.format(
+                            "Client connection timed out, have not heard from server in %dms for session id 0x%s",
+                            clientCnxnSocket.getIdleRecv(),
+                            Long.toHexString(sessionId));
+                        throw new ConnectionTimeoutException(warnInfo);
                     }
                     if (state.isConnected()) {
                         //1000(1 second) is to prevent race condition missing to send the second ping
@@ -1235,7 +1251,7 @@ public class ClientCnxn {
                     } else {
                         LOG.warn(
                             "Session 0x{} for server {}, Closing socket connection. "
-                                + "Attempting reconnect except it is a SessionExpiredException.",
+                                + "Attempting reconnect except it is a SessionExpiredException or SessionTimeoutException.",
                             Long.toHexString(getSessionId()),
                             serverAddress,
                             e);
@@ -1256,7 +1272,12 @@ public class ClientCnxn {
             if (state.isAlive()) {
                 eventThread.queueEvent(new WatchedEvent(Event.EventType.None, Event.KeeperState.Disconnected, null));
             }
-            eventThread.queueEvent(new WatchedEvent(Event.EventType.None, Event.KeeperState.Closed, null));
+            if (closing) {
+                eventThread.queueEvent(new WatchedEvent(Event.EventType.None, KeeperState.Closed, null));
+            } else if (state == States.CLOSED) {
+                eventThread.queueEvent(new WatchedEvent(Event.EventType.None, KeeperState.Expired, null));
+            }
+            eventThread.queueEventOfDeath();
 
             Login l = loginRef.getAndSet(null);
             if (l != null) {
@@ -1274,7 +1295,6 @@ public class ClientCnxn {
                 eventThread.queueEvent(new WatchedEvent(Event.EventType.None, Event.KeeperState.Disconnected, null));
             }
             clientCnxnSocket.updateNow();
-            clientCnxnSocket.updateLastSendAndHeard();
         }
 
         private void pingRwServer() throws RWServerFoundException {
@@ -1282,42 +1302,16 @@ public class ClientCnxn {
             InetSocketAddress addr = hostProvider.next(0);
 
             LOG.info("Checking server {} for being r/w. Timeout {}", addr, pingRwTimeout);
-
-            Socket sock = null;
-            BufferedReader br = null;
             try {
-                sock = new Socket(addr.getHostString(), addr.getPort());
-                sock.setSoLinger(false, -1);
-                sock.setSoTimeout(1000);
-                sock.setTcpNoDelay(true);
-                sock.getOutputStream().write("isro".getBytes());
-                sock.getOutputStream().flush();
-                sock.shutdownOutput();
-                br = new BufferedReader(new InputStreamReader(sock.getInputStream()));
-                result = br.readLine();
+                result = FourLetterWordMain.send4LetterWord(addr.getHostString(), addr.getPort(), "isro", clientConfig, 1000);
             } catch (ConnectException e) {
                 // ignore, this just means server is not up
-            } catch (IOException e) {
+            } catch (IOException | X509Exception.SSLContextException e) {
                 // some unexpected error, warn about it
                 LOG.warn("Exception while seeking for r/w server.", e);
-            } finally {
-                if (sock != null) {
-                    try {
-                        sock.close();
-                    } catch (IOException e) {
-                        LOG.warn("Unexpected exception", e);
-                    }
-                }
-                if (br != null) {
-                    try {
-                        br.close();
-                    } catch (IOException e) {
-                        LOG.warn("Unexpected exception", e);
-                    }
-                }
             }
 
-            if ("rw".equals(result)) {
+            if ("rw\n".equals(result)) {
                 pingRwTimeout = minPingRwTimeout;
                 // save the found address so that it's used during the next
                 // connection attempt
@@ -1374,6 +1368,7 @@ public class ClientCnxn {
             }
 
             readTimeout = negotiatedSessionTimeout * 2 / 3;
+            expirationTimeout = negotiatedSessionTimeout * 4 / 3;
             connectTimeout = negotiatedSessionTimeout / hostProvider.size();
             hostProvider.onConnected();
             sessionId = _sessionId;

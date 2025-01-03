@@ -203,7 +203,7 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
                 connectFuture = null;
             }
             if (channel != null) {
-                channel.close().syncUninterruptibly();
+                channel.close();
                 channel = null;
             }
         } finally {
@@ -402,7 +402,7 @@ public class ClientCnxnSocketNetty extends ClientCnxnSocket {
         }
     }
 
-    // *************** <END> CientCnxnSocketNetty </END> ******************
+    // *************** <END> ClientCnxnSocketNetty </END> ******************
     private static class WakeupPacket {
 
         private static final Packet instance = new Packet(null, null, null, null, null);

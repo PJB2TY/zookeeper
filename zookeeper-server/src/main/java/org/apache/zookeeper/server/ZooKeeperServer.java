@@ -135,6 +135,8 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     public static final String CLOSE_SESSION_TXN_ENABLED = "zookeeper.closeSessionTxn.enabled";
     private static boolean closeSessionTxnEnabled = true;
     private volatile CountDownLatch restoreLatch;
+    // exclusive lock for taking snapshot and restore
+    private final Object snapshotAndRestoreLock = new Object();
 
     static {
         LOG = LoggerFactory.getLogger(ZooKeeperServer.class);
@@ -554,7 +556,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     }
 
     public File takeSnapshot(boolean syncSnap) throws IOException {
-        return takeSnapshot(syncSnap, true, false);
+        return takeSnapshot(syncSnap, true);
     }
 
     /**
@@ -562,19 +564,16 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
      *
      * @param syncSnap syncSnap sync the snapshot immediately after write
      * @param isSevere if true system exist, otherwise throw IOException
-     * @param fastForwardFromEdits whether fast forward database to the latest recorded transactions
-     *
      * @return file snapshot file object
      * @throws IOException
      */
-    public synchronized File takeSnapshot(boolean syncSnap, boolean isSevere, boolean fastForwardFromEdits) throws IOException {
+    public File takeSnapshot(boolean syncSnap, boolean isSevere) throws IOException {
         long start = Time.currentElapsedTime();
         File snapFile = null;
         try {
-            if (fastForwardFromEdits) {
-                zkDb.fastForwardDataBase();
+            synchronized (snapshotAndRestoreLock) {
+                snapFile = txnLogFactory.save(zkDb.getDataTree(), zkDb.getSessionWithTimeOuts(), syncSnap);
             }
-            snapFile = txnLogFactory.save(zkDb.getDataTree(), zkDb.getSessionWithTimeOuts(), syncSnap);
         } catch (IOException e) {
             if (isSevere) {
                 LOG.error("Severe unrecoverable error, exiting", e);
@@ -598,7 +597,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
      * @Return last processed zxid
      * @throws IOException
      */
-    public synchronized long restoreFromSnapshot(final InputStream inputStream) throws IOException {
+    public long restoreFromSnapshot(final InputStream inputStream) throws IOException {
         if (inputStream == null) {
             throw new IllegalArgumentException("InputStream can not be null when restoring from snapshot");
         }
@@ -623,9 +622,10 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         restoreLatch = new CountDownLatch(1);
 
         try {
-            // set to the new zkDatabase
-            setZKDatabase(newZKDatabase);
-
+            synchronized (snapshotAndRestoreLock) {
+                // set to the new zkDatabase
+                setZKDatabase(newZKDatabase);
+            }
             // re-create SessionTrack
             createSessionTracker();
         } finally {
@@ -793,19 +793,6 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     }
 
     public synchronized void startup() {
-        startupWithServerState(State.RUNNING);
-    }
-
-    public synchronized void startupWithoutServing() {
-        startupWithServerState(State.INITIAL);
-    }
-
-    public synchronized void startServing() {
-        setState(State.RUNNING);
-        notifyAll();
-    }
-
-    private void startupWithServerState(State state) {
         if (sessionTracker == null) {
             createSessionTracker();
         }
@@ -820,7 +807,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
 
         registerMetrics();
 
-        setState(state);
+        setState(State.RUNNING);
 
         requestPathMetricsCollector.start();
 
@@ -913,7 +900,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
      * @return true if the server is running or server hits an error, false
      *         otherwise.
      */
-    protected boolean canShutdown() {
+    private boolean canShutdown() {
         return state == State.RUNNING || state == State.ERROR;
     }
 
@@ -924,27 +911,49 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         return state == State.RUNNING;
     }
 
-    public void shutdown() {
+    public final void shutdown() {
         shutdown(false);
     }
 
     /**
      * Shut down the server instance
-     * @param fullyShutDown true if another server using the same database will not replace this one in the same process
+     * @param fullyShutDown true when no other server will use the same database to replace this one
      */
-    public synchronized void shutdown(boolean fullyShutDown) {
-        if (!canShutdown()) {
-            if (fullyShutDown && zkDb != null) {
-                zkDb.clear();
+    public final synchronized void shutdown(boolean fullyShutDown) {
+        if (canShutdown()) {
+            LOG.info("Shutting down");
+
+            shutdownComponents();
+
+            if (zkDb != null && !fullyShutDown) {
+                // There is no need to clear the database if we are going to reuse it:
+                //  * When a new quorum is established we can still apply the diff
+                //    on top of the same zkDb data
+                //  * If we fetch a new snapshot from leader, the zkDb will be
+                //    cleared anyway before loading the snapshot
+                try {
+                    // This will fast-forward the database to the last recorded transaction
+                    zkDb.fastForwardDataBase();
+                } catch (IOException e) {
+                    LOG.error("Error updating DB", e);
+                    fullyShutDown = true;
+                }
             }
+            setState(State.SHUTDOWN);
+        } else {
             LOG.debug("ZooKeeper server is not running, so not proceeding to shutdown!");
-            return;
         }
-        LOG.info("shutting down");
+        if (zkDb != null && fullyShutDown) {
+            zkDb.clear();
+        }
+    }
 
-        // new RuntimeException("Calling shutdown").printStackTrace();
-        setState(State.SHUTDOWN);
-
+    /**
+     * @implNote
+     * Shuts down components owned by this class;
+     * remember to call super.shutdownComponents() when overriding!
+     */
+    protected void shutdownComponents() {
         // unregister all metrics that are keeping a strong reference to this object
         // subclasses will do their specific clean up
         unregisterMetrics();
@@ -953,9 +962,8 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             requestThrottler.shutdown();
         }
 
-        // Since sessionTracker and syncThreads poll we just have to
-        // set running to false and they will detect it during the poll
-        // interval.
+        // Since sessionTracker and syncThreads poll we just have to set running to false,
+        // and they will detect it during the poll interval.
         if (sessionTracker != null) {
             sessionTracker.shutdown();
         }
@@ -964,25 +972,6 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         }
         if (jvmPauseMonitor != null) {
             jvmPauseMonitor.serviceStop();
-        }
-
-        if (zkDb != null) {
-            if (fullyShutDown) {
-                zkDb.clear();
-            } else {
-                // else there is no need to clear the database
-                //  * When a new quorum is established we can still apply the diff
-                //    on top of the same zkDb data
-                //  * If we fetch a new snapshot from leader, the zkDb will be
-                //    cleared anyway before loading the snapshot
-                try {
-                    //This will fast forward the database to the latest recorded transactions
-                    zkDb.fastForwardDataBase();
-                } catch (IOException e) {
-                    LOG.error("Error updating DB", e);
-                    zkDb.clear();
-                }
-            }
         }
 
         requestPathMetricsCollector.shutdown();
@@ -1170,7 +1159,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             BinaryOutputArchive bos = BinaryOutputArchive.getArchive(baos);
             bos.writeInt(-1, "len");
-            rsp.serialize(bos, "connect");
+            cnxn.protocolManager.serializeConnectResponse(rsp, bos);
             baos.close();
             ByteBuffer bb = ByteBuffer.wrap(baos.toByteArray());
             bb.putInt(bb.remaining() - 4).rewind();
@@ -1822,7 +1811,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
                     }
                 }
             } catch (SaslException e) {
-                LOG.warn("Client {} failed to SASL authenticate: {}", cnxn.getRemoteSocketAddress(), e);
+                LOG.warn("Client {} failed to SASL authenticate", cnxn.getRemoteSocketAddress(), e);
                 if (shouldAllowSaslFailedClientsConnect() && !authHelper.isSaslAuthRequired()) {
                     LOG.warn("Maintaining client connection despite SASL authentication failure.");
                 } else {
@@ -2386,7 +2375,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
                 try {
                     request.cnxn.sendResponse(rh, null, null);
                 } catch (IOException e) {
-                    LOG.error("IOException : {}", e);
+                    LOG.warn("IOException", e);
                 }
             }
         }

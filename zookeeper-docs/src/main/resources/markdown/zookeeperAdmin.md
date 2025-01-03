@@ -772,6 +772,10 @@ property, when available, is noted below.
     time interval in hours for which the purge task has to
     be triggered. Set to a positive integer (1 and above)
     to enable the auto purging. Defaults to 0.
+    **Suffix support added in 3.10.0:** The interval is specified as an integer with an optional suffix to indicate the time unit.
+    Supported suffixes are: `ms` for milliseconds, `s` for seconds, `m` for minutes, `h` for hours, and `d` for days.
+    For example, "10m" represents 10 minutes, and "5h" represents 5 hours.
+    If no suffix is provided, the default unit is hours.
 
 * *syncEnabled* :
     (Java system property: **zookeeper.observer.syncEnabled**)
@@ -1572,6 +1576,17 @@ and [SASL authentication for ZooKeeper](https://cwiki.apache.org/confluence/disp
         - 1. Regenerate `superDigest` when migrating to new algorithm.
         - 2. `SetAcl` for a znode which already had a digest auth of old algorithm.
 
+* *IPAuthenticationProvider.usexforwardedfor* :
+    (Java system property: **zookeeper.IPAuthenticationProvider.usexforwardedfor**)
+    **New in 3.9.3:**
+    IPAuthenticationProvider uses the client IP address to authenticate the user. By 
+    default it reads the **Host** HTTP header to detect client IP address. In some 
+    proxy configurations the proxy server adds the **X-Forwarded-For** header to
+    the request in order to provide the IP address of the original client request. 
+    By enabling **usexforwardedfor** ZooKeeper setting, **X-Forwarded-For** will be preferred
+    over the standard **Host** header.
+    Default value is **false**.
+
 * *X509AuthenticationProvider.superUser* :
     (Java system property: **zookeeper.X509AuthenticationProvider.superUser**)
     The SSL-backed way to enable a ZooKeeper ensemble
@@ -1739,6 +1754,13 @@ and [SASL authentication for ZooKeeper](https://cwiki.apache.org/confluence/disp
     Disabling it only recommended for testing purposes.
     Default: true
 
+* *ssl.clientHostnameVerification* and *ssl.quorum.clientHostnameVerification* :
+    (Java system properties: **zookeeper.ssl.clientHostnameVerification** and **zookeeper.ssl.quorum.clientHostnameVerification**)
+    **New in 3.9.4:**
+    Specifies whether the client's hostname verification is enabled in client and quorum TLS negotiation process.
+    This option requires the corresponding *hostnameVerification* option to be `true`, or it will be ignored.
+    Default: true for quorum, false for clients
+
 * *ssl.crl* and *ssl.quorum.crl* :
     (Java system properties: **zookeeper.ssl.crl** and **zookeeper.ssl.quorum.crl**)
     **New in 3.5.5:**
@@ -1844,10 +1866,14 @@ and [SASL authentication for ZooKeeper](https://cwiki.apache.org/confluence/disp
 * *fips-mode* :
     (Java system property: **zookeeper.fips-mode**)
     **New in 3.8.2:**
-    Enable FIPS compatibility mode in ZooKeeper. If enabled, the custom trust manager (`ZKTrustManager`) that is used for 
-    hostname verification will be disabled in order to comply with FIPS requirements. As a consequence, hostname verification is not
-    available in the Quorum protocol, but still can be set in client-server communication. Default: **true** (3.9.0+), 
-    **false** (3.8.x)
+    Enable FIPS compatibility mode in ZooKeeper. If enabled, the following things will be changed in order to comply 
+    with FIPS requirements:
+    * Custom trust manager (`ZKTrustManager`) that is used for hostname verification will be disabled. As a consequence, 
+      hostname verification is not available in the Quorum protocol, but still can be set in client-server communication. 
+    * DIGEST-MD5 Sasl auth mechanism will be disabled in Quorum and ZooKeeper Sasl clients. Only GSSAPI (Kerberos)
+      can be used.
+    
+    Default: **true** (3.9.0+), **false** (3.8.x)
 
 <a name="Experimental+Options%2FFeatures"></a>
 
